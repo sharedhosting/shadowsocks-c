@@ -3,22 +3,27 @@ name: Build Ubuntu 26.04 Static
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches:
+      - master
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Ubuntu 26.04 AMD64
     runs-on: ubuntu-26.04
 
     steps:
+      # 1. 获取源码
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. 安装编译工具
       - name: Install dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             clang \
@@ -29,25 +34,56 @@ jobs:
             binutils \
             file
 
+      # 3. CMake 配置
       - name: Configure
         run: |
-          cmake -S . -B build \
+          CC=clang CXX=clang++ cmake -S . -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_EXE_LINKER_FLAGS="-static -fuse-ld=lld" \
             -DSS_DEPENDENCY_MODE=bundled \
             -DWITH_STATIC=ON \
             -DSS_BUILD_EXECUTABLES=ON \
             -DSS_BUILD_STATIC_LIBRARY=OFF \
             -DSS_BUILD_SHARED_LIBRARY=OFF \
-            -DSS_MINIMAL=OFF
+            -DSS_MINIMAL=OFF \
+            -DWITH_DOC_MAN=OFF \
+            -DWITH_DOC_HTML=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -fuse-ld=lld" \
+            -DCMAKE_INSTALL_PREFIX=/out
 
+      # 4. 编译
       - name: Build
         run: |
-          cmake --build build --parallel
+          cmake --build build --parallel 4
 
-      - name: Collect static binaries
+      # 5. 官方单元及第三方依赖测试
+      - name: Unit and vendor tests
+        run: |
+          ctest --test-dir build \
+            -L 'unit|vendor' \
+            --output-on-failure \
+            --no-tests=error
+
+      # 6. TCP / UDP 互通测试
+      - name: TCP UDP interoperability tests
+        run: |
+          python3 tests/interop.py \
+            --self \
+            --bin build/bin
+
+      # 7. 异步 DNS 测试
+      - name: Async DNS tests
+        run: |
+          python3 tests/async_dns_interop.py \
+            --bin build/bin
+
+      # 8. 安装编译产物
+      - name: Install
+        run: |
+          cmake --install build --strip
+
+      # 9. 只提取五个最终二进制
+      - name: Collect binaries
         run: |
           set -e
 
@@ -60,9 +96,9 @@ jobs:
             ss-redir \
             ss-tunnel
           do
-            src=$(find build -type f -name "$bin" -print -quit)
+            src="/out/bin/$bin"
 
-            if [ -z "$src" ]; then
+            if [ ! -f "$src" ]; then
               echo "ERROR: Missing binary: $bin"
               exit 1
             fi
@@ -71,11 +107,21 @@ jobs:
             chmod 755 "dist/$bin"
           done
 
+      # 10. 检查静态链接
       - name: Verify static binaries
         run: |
           set -e
 
+          expected=5
+          actual=$(find dist -maxdepth 1 -type f | wc -l)
+
+          if [ "$actual" -ne "$expected" ]; then
+            echo "ERROR: Expected 5 binaries, found $actual"
+            exit 1
+          fi
+
           for f in dist/*; do
+            echo "================================"
             echo "Checking: $f"
 
             file "$f"
@@ -91,13 +137,19 @@ jobs:
             fi
           done
 
-          echo "All binaries are statically linked."
+          echo "All binaries passed static checks."
 
-      - name: Show final files
+      # 11. 显示文件大小及 SHA256
+      - name: Show build results
         run: |
+          echo "========== FILES =========="
           ls -lh dist/
 
-      - name: Upload Ubuntu binaries
+          echo "========== SHA256 =========="
+          sha256sum dist/*
+
+      # 12. 上传最终产物
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: shadowsocks-c-ubuntu-26.04-amd64-static
