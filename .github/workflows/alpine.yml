@@ -3,22 +3,29 @@ name: Build Alpine Static
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches:
+      - master
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Alpine 3.24 AMD64
     runs-on: ubuntu-24.04
 
     steps:
+      # 1. 获取源码
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # 2. Docker 环境
+      - name: Check Docker Buildx
+        run: |
+          docker version
+          docker buildx version
 
+      # 3. 使用官方 Dockerfile 编译
       - name: Build Alpine static binaries
         run: |
           docker buildx build \
@@ -28,14 +35,17 @@ jobs:
             --output type=local,dest=output \
             .
 
+      # 4. 安装 ELF 检查工具
       - name: Install verification tools
         run: |
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
             binutils \
             file
 
-      - name: Collect static binaries
+      # 5. 只提取五个最终二进制
+      - name: Collect binaries
         run: |
           set -e
 
@@ -48,9 +58,9 @@ jobs:
             ss-redir \
             ss-tunnel
           do
-            src=$(find output -type f -name "$bin" -print -quit)
+            src="output/bin/$bin"
 
-            if [ -z "$src" ]; then
+            if [ ! -f "$src" ]; then
               echo "ERROR: Missing binary: $bin"
               exit 1
             fi
@@ -59,11 +69,21 @@ jobs:
             chmod 755 "dist/$bin"
           done
 
+      # 6. 检查静态链接
       - name: Verify static binaries
         run: |
           set -e
 
+          expected=5
+          actual=$(find dist -maxdepth 1 -type f | wc -l)
+
+          if [ "$actual" -ne "$expected" ]; then
+            echo "ERROR: Expected 5 binaries, found $actual"
+            exit 1
+          fi
+
           for f in dist/*; do
+            echo "================================"
             echo "Checking: $f"
 
             file "$f"
@@ -79,16 +99,22 @@ jobs:
             fi
           done
 
-          echo "All binaries are statically linked."
+          echo "All binaries passed static checks."
 
-      - name: Show final files
+      # 7. 显示文件大小及 SHA256
+      - name: Show build results
         run: |
+          echo "========== FILES =========="
           ls -lh dist/
 
-      - name: Upload Alpine binaries
+          echo "========== SHA256 =========="
+          sha256sum dist/*
+
+      # 8. 上传最终产物
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: shadowsocks-c-alpine-amd64-static
+          name: shadowsocks-c-alpine-3.24-amd64-static
           path: dist/
           if-no-files-found: error
           retention-days: 30
