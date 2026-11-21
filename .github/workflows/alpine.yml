@@ -1,0 +1,94 @@
+name: Build Alpine Static
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Alpine static binaries
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f docker/static/Dockerfile \
+            --target artifacts \
+            --output type=local,dest=output \
+            .
+
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            file
+
+      - name: Collect static binaries
+        run: |
+          set -e
+
+          mkdir -p dist
+
+          for bin in \
+            ss-server \
+            ss-local \
+            ss-manager \
+            ss-redir \
+            ss-tunnel
+          do
+            src=$(find output -type f -name "$bin" -print -quit)
+
+            if [ -z "$src" ]; then
+              echo "ERROR: Missing binary: $bin"
+              exit 1
+            fi
+
+            cp "$src" "dist/$bin"
+            chmod 755 "dist/$bin"
+          done
+
+      - name: Verify static binaries
+        run: |
+          set -e
+
+          for f in dist/*; do
+            echo "Checking: $f"
+
+            file "$f"
+
+            if readelf -l "$f" | grep -q INTERP; then
+              echo "ERROR: Dynamic interpreter detected!"
+              exit 1
+            fi
+
+            if readelf -d "$f" 2>/dev/null | grep -q NEEDED; then
+              echo "ERROR: Dynamic dependencies detected!"
+              exit 1
+            fi
+          done
+
+          echo "All binaries are statically linked."
+
+      - name: Show final files
+        run: |
+          ls -lh dist/
+
+      - name: Upload Alpine binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowsocks-c-alpine-amd64-static
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
