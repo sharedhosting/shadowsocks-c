@@ -11,22 +11,14 @@ permissions:
 
 jobs:
   build:
-    name: Alpine 3.24 AMD64
+    name: Alpine 3.24 Static AMD64
     runs-on: ubuntu-24.04
 
     steps:
-      # 1. 获取源码
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v7
 
-      # 2. Docker 环境
-      - name: Check Docker Buildx
-        run: |
-          docker version
-          docker buildx version
-
-      # 3. 使用官方 Dockerfile 编译
-      - name: Build Alpine static binaries
+      - name: Build static binaries
         run: |
           docker buildx build \
             --platform linux/amd64 \
@@ -35,86 +27,74 @@ jobs:
             --output type=local,dest=output \
             .
 
-      # 4. 安装 ELF 检查工具
       - name: Install verification tools
         run: |
           sudo apt-get update
+          sudo apt-get install -y binutils file
 
-          sudo apt-get install -y --no-install-recommends \
-            binutils \
-            file
-
-      # 5. 只提取五个最终二进制
       - name: Collect binaries
         run: |
-          set -e
-
           mkdir -p dist
 
-          for bin in \
+          for name in \
             ss-server \
             ss-local \
             ss-manager \
             ss-redir \
             ss-tunnel
           do
-            src="output/bin/$bin"
-
-            if [ ! -f "$src" ]; then
-              echo "ERROR: Missing binary: $bin"
+            if [ ! -f "output/bin/$name" ]; then
+              echo "ERROR: Missing binary: $name"
               exit 1
             fi
 
-            cp "$src" "dist/$bin"
-            chmod 755 "dist/$bin"
+            cp "output/bin/$name" dist/
+            chmod +x "dist/$name"
           done
 
-      # 6. 检查静态链接
-      - name: Verify static binaries
+      - name: Verify ELF binaries
         run: |
           set -e
 
-          expected=5
-          actual=$(find dist -maxdepth 1 -type f | wc -l)
-
-          if [ "$actual" -ne "$expected" ]; then
-            echo "ERROR: Expected 5 binaries, found $actual"
-            exit 1
-          fi
-
           for f in dist/*; do
-            echo "================================"
-            echo "Checking: $f"
+            echo "===== $f ====="
 
             file "$f"
 
+            readelf -h "$f" | grep -q "Advanced Micro Devices X86-64"
+
             if readelf -l "$f" | grep -q INTERP; then
-              echo "ERROR: Dynamic interpreter detected!"
+              echo "ERROR: Dynamic interpreter detected"
               exit 1
             fi
 
-            if readelf -d "$f" 2>/dev/null | grep -q NEEDED; then
-              echo "ERROR: Dynamic dependencies detected!"
+            if readelf -d "$f" | grep -q NEEDED; then
+              echo "ERROR: Dynamic dependency detected"
               exit 1
             fi
+
+            echo "Static ELF: OK"
           done
 
-          echo "All binaries passed static checks."
-
-      # 7. 显示文件大小及 SHA256
-      - name: Show build results
+      - name: Test binaries
         run: |
-          echo "========== FILES =========="
-          ls -lh dist/
+          set -e
 
-          echo "========== SHA256 =========="
-          sha256sum dist/*
+          for f in dist/*; do
+            echo "===== $f ====="
+            "$f" --version
+          done
 
-      # 8. 上传最终产物
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Generate SHA256
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Upload Alpine binaries
+        uses: actions/upload-artifact@v7
         with:
-          name: shadowsocks-c-alpine-3.24-amd64-static
+          name: shadowsocks-c-alpine-amd64
           path: dist/
           if-no-files-found: error
+          compression-level: 9
           retention-days: 30
