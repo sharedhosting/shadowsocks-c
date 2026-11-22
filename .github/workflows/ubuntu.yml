@@ -1,4 +1,4 @@
-name: Build Ubuntu 26.04 Static
+name: Build Ubuntu 24.04 Static
 
 on:
   workflow_dispatch:
@@ -11,148 +11,137 @@ permissions:
 
 jobs:
   build:
-    name: Ubuntu 26.04 AMD64
-    runs-on: ubuntu-26.04
+    name: Ubuntu 24.04 Static AMD64
+    runs-on: ubuntu-24.04
 
     steps:
-      # 1. 获取源码
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v7
 
-      # 2. 安装编译工具
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
 
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y \
             build-essential \
-            clang \
-            lld \
             cmake \
             ninja-build \
             python3 \
             binutils \
             file
 
-      # 3. CMake 配置
+      - name: Show toolchain
+        run: |
+          gcc --version
+          cmake --version
+          ninja --version
+
       - name: Configure
         run: |
-          CC=clang CXX=clang++ cmake -S . -B build \
-            -G Ninja \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
             -DSS_DEPENDENCY_MODE=bundled \
             -DWITH_STATIC=ON \
             -DSS_BUILD_EXECUTABLES=ON \
             -DSS_BUILD_STATIC_LIBRARY=OFF \
             -DSS_BUILD_SHARED_LIBRARY=OFF \
             -DSS_MINIMAL=OFF \
-            -DWITH_DOC_MAN=OFF \
-            -DWITH_DOC_HTML=OFF \
-            -DCMAKE_EXE_LINKER_FLAGS="-static -fuse-ld=lld" \
+            -DSS_ENABLE_REGEX=ON \
+            -DSS_ENABLE_PLUGINS=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DCMAKE_INSTALL_PREFIX=/out
 
-      # 4. 编译
       - name: Build
         run: |
           cmake --build build --parallel 4
 
-      # 5. 官方单元及第三方依赖测试
-      - name: Unit and vendor tests
+      - name: Run unit and vendor tests
         run: |
-          ctest --test-dir build \
+          ctest \
+            --test-dir build \
             -L 'unit|vendor' \
             --output-on-failure \
             --no-tests=error
 
-      # 6. TCP / UDP 互通测试
-      - name: TCP UDP interoperability tests
+      - name: Run interoperability tests
         run: |
           python3 tests/interop.py \
             --self \
             --bin build/bin
 
-      # 7. 异步 DNS 测试
-      - name: Async DNS tests
-        run: |
           python3 tests/async_dns_interop.py \
             --bin build/bin
 
-      # 8. 安装编译产物
-      - name: Install
+      - name: Install binaries
         run: |
           cmake --install build --strip
 
-      # 9. 只提取五个最终二进制
       - name: Collect binaries
         run: |
           set -e
 
           mkdir -p dist
 
-          for bin in \
+          for name in \
             ss-server \
             ss-local \
             ss-manager \
             ss-redir \
             ss-tunnel
           do
-            src="/out/bin/$bin"
-
-            if [ ! -f "$src" ]; then
-              echo "ERROR: Missing binary: $bin"
+            if [ ! -f "/out/bin/$name" ]; then
+              echo "ERROR: Missing binary: $name"
               exit 1
             fi
 
-            cp "$src" "dist/$bin"
-            chmod 755 "dist/$bin"
+            cp "/out/bin/$name" dist/
+            chmod +x "dist/$name"
           done
 
-      # 10. 检查静态链接
-      - name: Verify static binaries
+      - name: Verify ELF binaries
         run: |
           set -e
 
-          expected=5
-          actual=$(find dist -maxdepth 1 -type f | wc -l)
-
-          if [ "$actual" -ne "$expected" ]; then
-            echo "ERROR: Expected 5 binaries, found $actual"
-            exit 1
-          fi
-
           for f in dist/*; do
-            echo "================================"
-            echo "Checking: $f"
+            echo "===== $f ====="
 
             file "$f"
 
+            readelf -h "$f" | grep -q "Advanced Micro Devices X86-64"
+
             if readelf -l "$f" | grep -q INTERP; then
-              echo "ERROR: Dynamic interpreter detected!"
+              echo "ERROR: Dynamic interpreter detected"
               exit 1
             fi
 
-            if readelf -d "$f" 2>/dev/null | grep -q NEEDED; then
-              echo "ERROR: Dynamic dependencies detected!"
+            if readelf -d "$f" | grep -q NEEDED; then
+              echo "ERROR: Dynamic dependency detected"
               exit 1
             fi
+
+            echo "Static ELF: OK"
           done
 
-          echo "All binaries passed static checks."
-
-      # 11. 显示文件大小及 SHA256
-      - name: Show build results
+      - name: Test binaries
         run: |
-          echo "========== FILES =========="
-          ls -lh dist/
+          set -e
 
-          echo "========== SHA256 =========="
-          sha256sum dist/*
+          for f in dist/*; do
+            echo "===== $f ====="
+            "$f" --version
+          done
 
-      # 12. 上传最终产物
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Generate SHA256
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Upload Ubuntu binaries
+        uses: actions/upload-artifact@v7
         with:
-          name: shadowsocks-c-ubuntu-26.04-amd64-static
+          name: shadowsocks-c-ubuntu-amd64
           path: dist/
           if-no-files-found: error
+          compression-level: 9
           retention-days: 30
