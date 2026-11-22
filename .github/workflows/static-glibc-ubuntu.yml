@@ -1,0 +1,142 @@
+name: static-glibc-ubuntu
+
+# Build fully static glibc/gcc binaries on the native Ubuntu 24.04 runner.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create tag/release with the static binaries'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  SHORT_SHA: ${{ github.sha }}
+
+jobs:
+  static-glibc:
+    name: gcc / glibc static (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build binutils file zip unzip python3
+
+      - name: Configure (bundled deps, static libc)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DSS_DEPENDENCY_MODE=bundled \
+            -DWITH_STATIC=ON \
+            -DSS_BUILD_STATIC_LIBRARY=OFF \
+            -DSS_BUILD_SHARED_LIBRARY=OFF \
+            -DSS_MINIMAL=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++" \
+            -DCMAKE_INSTALL_PREFIX="$PWD/install"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit and vendor tests
+        # Static binaries cannot be instrumented through LD_PRELOAD.
+        run: ctest --test-dir build -L 'unit|vendor' -E '^alloc_steady_' --output-on-failure --no-tests=error
+
+      - name: Real TCP/UDP relay and async DNS tests
+        run: |
+          python3 tests/interop.py --self --bin build/bin
+          python3 tests/async_dns_interop.py --bin build/bin
+
+      - name: Verify fully static ELF binaries
+        run: |
+          set -eu
+          for binary in \
+            build/bin/ss-local \
+            build/bin/ss-server \
+            build/bin/ss-tunnel \
+            build/bin/ss-manager \
+            build/bin/ss-redir
+          do
+            test -f "$binary" || { echo "missing $binary"; exit 1; }
+            file "$binary"
+            ! readelf -l "$binary" | grep -q INTERP || {
+              echo "INTERP found: $binary"
+              exit 1
+            }
+            ! readelf -d "$binary" | grep -q NEEDED || {
+              echo "NEEDED found: $binary"
+              exit 1
+            }
+          done
+          echo "OK: all five binaries are fully static"
+
+      - name: Package the five static binaries
+        id: package
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64) ARCH=amd64 ;;
+            aarch64|arm64) ARCH=arm64 ;;
+            *) ARCH="$(uname -m)" ;;
+          esac
+
+          rm -rf "$PWD/dist"
+          mkdir -p "$PWD/dist"
+
+          for b in ss-local ss-server ss-tunnel ss-manager ss-redir; do
+            cp "build/bin/$b" "$PWD/dist/$b"
+          done
+
+          ZIP="$PWD/shadowsocks-c-linux-glibc-${ARCH}-${SHORT_SHA::8}.zip"
+
+          (
+            cd "$PWD/dist"
+            zip -9 -X "$ZIP" \
+              ss-local ss-server ss-tunnel ss-manager ss-redir
+          )
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="static-glibc-${ARCH}-${SHORT_SHA::8}"
+          fi
+
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Created $ZIP"
+          unzip -l "$ZIP"
+
+      - name: Tag and publish static binaries
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: "shadowsocks-c glibc static ${{ steps.package.outputs.tag }}"
+          files: ${{ steps.package.outputs.zip }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Upload zip as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowsocks-c-glibc-ubuntu-24.04-${{ steps.package.outputs.arch }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14
