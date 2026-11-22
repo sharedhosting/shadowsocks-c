@@ -1,0 +1,123 @@
+name: static-musl-alpine
+
+# Build fully static musl/clang binaries using docker/static/Dockerfile.
+# Ubuntu is only the GitHub Actions host; compilation and tests run in Alpine.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create tag/release with the static binaries'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  SHORT_SHA: ${{ github.sha }}
+
+jobs:
+  static-musl:
+    name: clang / musl static (Alpine 3.24)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils file zip unzip
+
+      - name: Build and test musl binaries with the project Dockerfile
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --file docker/static/Dockerfile \
+            --target artifacts \
+            --output type=local,dest=dist \
+            .
+
+      - name: Verify fully static ELF binaries
+        run: |
+          set -eu
+          for name in \
+            ss-local \
+            ss-server \
+            ss-tunnel \
+            ss-manager \
+            ss-redir
+          do
+            binary="dist/bin/$name"
+            test -f "$binary" || { echo "missing $binary"; exit 1; }
+            file "$binary"
+            ! readelf -l "$binary" | grep -q INTERP || {
+              echo "INTERP found: $binary"
+              exit 1
+            }
+            ! readelf -d "$binary" | grep -q NEEDED || {
+              echo "NEEDED found: $binary"
+              exit 1
+            }
+          done
+          echo "OK: all five binaries are fully static"
+
+      - name: Package the five static binaries
+        id: package
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64) ARCH=amd64 ;;
+            aarch64|arm64) ARCH=arm64 ;;
+            *) ARCH="$(uname -m)" ;;
+          esac
+
+          ZIP="$PWD/shadowsocks-c-linux-musl-${ARCH}-${SHORT_SHA::8}.zip"
+
+          (
+            cd "$PWD/dist/bin"
+            zip -9 -X "$ZIP" \
+              ss-local ss-server ss-tunnel ss-manager ss-redir
+          )
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="static-musl-${ARCH}-${SHORT_SHA::8}"
+          fi
+
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Created $ZIP"
+          unzip -l "$ZIP"
+
+      - name: Tag and publish static binaries
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: "shadowsocks-c musl static ${{ steps.package.outputs.tag }}"
+          files: ${{ steps.package.outputs.zip }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Upload zip as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowsocks-c-musl-alpine3.24-${{ steps.package.outputs.arch }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14
